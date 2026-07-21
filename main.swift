@@ -1393,6 +1393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let opencodeLive = result.contains { $0.kind == .opencode && $0.anyLive }
                 let opencodeBusy = result.contains { $0.kind == .opencode && $0.anyBusy }
                 let hermesLive = result.contains { $0.kind == .hermes && $0.anyLive }
+                let hermesBusy = result.contains { $0.kind == .hermes && $0.anyBusy }
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
                     : (self.claudeWasLive ? .done : self.claudeState)
@@ -1402,7 +1403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.opencodeState = opencodeBusy ? .running
                     : opencodeLive ? .inactive
                     : (self.opencodeWasLive ? .done : self.opencodeState)
-                self.hermesState = hermesLive ? .running
+                self.hermesState = hermesBusy ? .running
+                    : hermesLive ? .inactive
                     : (self.hermesWasLive ? .done : self.hermesState)
                 self.claudeWasLive = claudeLive
                 self.codexWasLive = codexLive
