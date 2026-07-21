@@ -42,13 +42,15 @@ final class ProcessDiscovery {
     // rollout file open, so the path route always works there.
     struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
 
-    private static let psTimeout: TimeInterval = 0.5
-    private static let lsofTimeout: TimeInterval = 0.2
+    // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
+    // heavy load (a codex swarm compiling) blows through 0.2s and every agent
+    // reads as dead — so: generous budgets, and ONE batched lsof per poll.
+    private static let psTimeout: TimeInterval = 2.0
+    private static let lsofTimeout: TimeInterval = 2.0
 
     func liveTranscripts() -> [Snapshot] {
         guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,command="], timeout: Self.psTimeout) else { return [] }
-        var out: [Snapshot] = []
-        var claimed = Set<String>()
+        var candidates: [(pid: String, tty: String, kind: AgentKind)] = []
         for line in psOut.split(whereSeparator: \.isNewline) {
             let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 .split(maxSplits: 3, whereSeparator: \.isWhitespace)
@@ -56,11 +58,14 @@ final class ProcessDiscovery {
             let pid = String(parts[0]), tty = String(parts[2])
             let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
-            let kind: AgentKind
-            if isClaude(command) { kind = .claude }
-            else if isCodex(command) { kind = .codex }
-            else { continue }
-            guard let lsof = run("/usr/sbin/lsof", ["-a", "-p", pid, "-Fn"], timeout: Self.lsofTimeout) else { continue }
+            if isClaude(command) { candidates.append((pid, tty, .claude)) }
+            else if isCodex(command) { candidates.append((pid, tty, .codex)) }
+        }
+        let chunks = lsofChunks(pids: candidates.map(\.pid))
+        var out: [Snapshot] = []
+        var claimed = Set<String>()
+        for (pid, tty, kind) in candidates {
+            guard let lsof = chunks[pid] else { continue }
             let cwd = workingDirectory(from: lsof)
             // Claude subagents run in .claude/worktrees/agent-*/ — they are
             // metadata on the parent session, not sessions of their own.
@@ -79,6 +84,26 @@ final class ProcessDiscovery {
             }
         }
         return out
+    }
+
+    /// One lsof for all pids; -Fn output is split per-pid on its `p<pid>` markers.
+    private func lsofChunks(pids: [String]) -> [String: String] {
+        guard !pids.isEmpty,
+              let outText = run("/usr/sbin/lsof", ["-a", "-p", pids.joined(separator: ","), "-Fn"], timeout: Self.lsofTimeout) else { return [:] }
+        var chunks: [String: String] = [:]
+        var curPid: String?
+        var cur = ""
+        for line in outText.split(whereSeparator: \.isNewline) {
+            if line.first == "p" {
+                if let p = curPid { chunks[p] = cur }
+                curPid = String(line.dropFirst())
+                cur = ""
+            } else {
+                cur += line + "\n"
+            }
+        }
+        if let p = curPid { chunks[p] = cur }
+        return chunks
     }
 
     private func isClaude(_ command: String) -> Bool {
