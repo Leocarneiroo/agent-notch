@@ -55,12 +55,22 @@ final class ProcessDiscovery {
             guard parts.count == 4 else { continue }
             let pid = String(parts[0]), tty = String(parts[2])
             let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
+            guard !command.isEmpty else { continue }
+            let hasTTY = tty != "??"
             let kind: AgentKind
             if isClaude(command) { kind = .claude }
             else if isCodex(command) { kind = .codex }
             else if isOpenCode(command) { kind = .opencode }
             else { continue }
+            // Claude requires terminal; Codex/OpenCode can be desktop apps without TTY
+            if kind == .claude, !hasTTY { continue }
+            // Codex desktop (no TTY): sentinel without lsof — desktop app has too many
+            // open files for lsof to be reliable at 0.2 s timeout
+            if kind == .codex, !hasTTY {
+                guard claimed.insert("codex-desktop").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                continue
+            }
             guard let lsof = run("/usr/sbin/lsof", ["-a", "-p", pid, "-Fn"], timeout: Self.lsofTimeout) else { continue }
             let cwd = workingDirectory(from: lsof)
             // Claude subagents run in .claude/worktrees/agent-*/ — they are
@@ -74,9 +84,14 @@ final class ProcessDiscovery {
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             case .codex:
-                guard let path = bestCodexTranscript(in: lsof),
-                      claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                if let path = bestCodexTranscript(in: lsof) {
+                    guard claimed.insert("codex:\(path)").inserted else { continue }
+                    out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                } else {
+                    // Desktop app (no open JSONL): sentinel for global Codex liveness
+                    guard claimed.insert("codex-desktop").inserted else { continue }
+                    out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                }
             case .opencode:
                 // OpenCode uses SQLite — cwd-based fallback, like Claude
                 guard cwd != nil else { continue }
@@ -249,6 +264,7 @@ final class SessionScanner {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".codex/sessions")
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
+        let codexDesktopLive = live.contains("codex-desktop")
         for case let f as URL in en where f.pathExtension == "jsonl" {
             guard let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
             // Skip old files early to avoid reading them
@@ -258,7 +274,8 @@ final class SessionScanner {
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
-            sess.isLive = live.contains(f.path)
+            // ponytail: desktop sentinel marks all Codex sessions live; single-session assumption
+            sess.isLive = live.contains(f.path) || codexDesktopLive
             sess.threadID = meta.id
             sess.parentID = meta.parentID
             sess.nickname = meta.nickname
@@ -1208,6 +1225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     seen.insert("cwd#\(encoded)#\(i)")
                 } else if snap.kind == .opencode, let cwd = snap.cwd {
                     seen.insert("opencode:\(cwd)")
+                } else if snap.kind == .codex {
+                    // Desktop sentinel: process alive but no open transcript
+                    seen.insert("codex-desktop")
                 }
             }
             for p in seen { self.missCounts[p] = 0 }
@@ -1290,6 +1310,7 @@ if CommandLine.arguments.contains("--scan") {
         if let p = s.transcriptPath { live.insert(p) }
         else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
         else if s.kind == .opencode, let c = s.cwd { opencodeCwds.insert(c) }
+        else if s.kind == .codex { live.insert("codex-desktop") }
     }
     print("== sessions ==")
     for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts, opencodeCwds: opencodeCwds) {
